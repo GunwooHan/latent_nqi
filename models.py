@@ -1,9 +1,10 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-import pytorch_lightning as pl
 import torch.optim.lr_scheduler as lr_scheduler
+import pytorch_lightning as pl
 
 
 class LocalState(nn.Module):
@@ -152,12 +153,12 @@ class ResidualBranch(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, attention=False) -> None:
         super(ResidualBranch, self).__init__()
         self.model = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels // 4, kernel_size=3, padding="same"),
-            nn.GroupNorm(1, in_channels // 4),
+            nn.Conv1d(in_channels, out_channels // 4, kernel_size=3, padding=1),
+            nn.GroupNorm(1, out_channels // 4),
             nn.GELU(),
-            BLSTM(in_channels // 4, layers=2, max_steps=200, skip=True) if attention else nn.Identity(),
-            LocalState(in_channels // 4, heads=4, ndecay=4) if attention else nn.Identity(),
-            nn.Conv1d(in_channels // 4, out_channels * 2, kernel_size=1),
+            BLSTM(out_channels // 4, layers=2, max_steps=200, skip=True) if attention else nn.Identity(),
+            LocalState(out_channels // 4, heads=4, ndecay=4) if attention else nn.Identity(),
+            nn.Conv1d(out_channels // 4, out_channels * 2, kernel_size=1),
             nn.GroupNorm(1, out_channels * 2),
             nn.GLU(1),
             LayerScale(out_channels, 1e-4)
@@ -172,13 +173,13 @@ class HDEncoder(nn.Module):
     def __init__(self, in_channels, out_channels, attension=False):
         super(HDEncoder, self).__init__()
         self.layer1 = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels, kernel_size=8, stride=4, padding=2),
+            nn.Conv1d(in_channels, out_channels, kernel_size=8, stride=4, padding=2),
             nn.GELU()
         )
-        self.block1 = ResidualBranch(in_channels, in_channels, attension)
-        self.block2 = ResidualBranch(in_channels, in_channels, attension)
+        self.block1 = ResidualBranch(out_channels, out_channels, attension)
+        self.block2 = ResidualBranch(out_channels, out_channels, attension)
         self.layer2 = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1),
+            nn.Conv1d(out_channels, 2 * out_channels, kernel_size=1, stride=1),
             nn.GLU(1)
         )
 
@@ -194,13 +195,13 @@ class HDDecoder(nn.Module):
     def __init__(self, in_channels, out_channels, attension=False):
         super(HDDecoder, self).__init__()
         self.layer1 = nn.Sequential(
-            nn.ConvTranspose1d(in_channels, in_channels, kernel_size=8, stride=4, padding=2),
+            nn.ConvTranspose1d(in_channels, out_channels, kernel_size=8, stride=4, padding=2),
             nn.GELU()
         )
-        self.block1 = ResidualBranch(in_channels, in_channels, attension)
-        self.block2 = ResidualBranch(in_channels, in_channels, attension)
+        self.block1 = ResidualBranch(out_channels, out_channels, attension)
+        self.block2 = ResidualBranch(out_channels, out_channels, attension)
         self.layer2 = nn.Sequential(
-            nn.ConvTranspose1d(in_channels, out_channels, kernel_size=1, stride=1),
+            nn.ConvTranspose1d(out_channels, 2 * out_channels, kernel_size=1, stride=1),
             nn.GLU(1)
         )
 
@@ -215,18 +216,17 @@ class HDDecoder(nn.Module):
 class HDemucs(pl.LightningModule):
     def __init__(self):
         super(HDemucs, self).__init__()
-        self.encoder = None
-        self.decoder = None
-        self.aux_cls_head = None
+        self.encoder = HDEncoder(85, 170)
+        self.decoder = HDDecoder(170, 85)
+        self.aux_cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(start_dim=1),
+            nn.Linear(170, 4),
+        )
 
     def configure_optimizers(self):
-        if self.args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.args.learning_rate)
-        elif self.args.optimizer == 'adamw':
-            optimizer = torch.optim.AdamW(self.parameters(), lr=self.args.learning_rate)
-
-        if self.args.scheduler == "steplr":
-            scheduler = lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=0.0001)
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def training_step(self, train_batch, batch_idx):
@@ -242,6 +242,7 @@ class HDemucs(pl.LightningModule):
         self.log('train/recon_loss', loss_recon)
         self.log('train/cls_loss', loss_cls)
         self.log('train/loss', loss)
+        return {"loss": loss}
 
     def validation_step(self, val_batch, batch_idx):
         tensor_signal, tensor_label_cls = val_batch
