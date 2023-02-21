@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 import pytorch_lightning as pl
+import torchvision
 
 
 class LocalState(nn.Module):
@@ -213,57 +214,158 @@ class HDDecoder(nn.Module):
         return x4
 
 
-class HDemucs(pl.LightningModule):
-    def __init__(self):
-        super(HDemucs, self).__init__()
-        self.encoder = HDEncoder(85, 170)
-        self.decoder = HDDecoder(170, 85)
+class HybridDemucs(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.channels = 48
+        self.enc1 = HDEncoder(in_channels, self.channels * 2)
+        self.enc2 = HDEncoder(self.channels * 2, self.channels * 4)
+        self.enc3 = HDEncoder(self.channels * 4, self.channels * 8)
+        self.enc4 = HDEncoder(self.channels * 8, self.channels * 16, attension=True)
+        # self.enc5 = HDEncoder(self.channels * 16, self.channels * 32, attension=True)
+        #
+        # self.dec1 = HDDecoder(self.channels * 32, self.channels * 16, attension=True)
+        self.dec2 = HDDecoder(self.channels * 16, self.channels * 8, attension=True)
+        self.dec3 = HDDecoder(self.channels * 8, self.channels * 4)
+        self.dec4 = HDDecoder(self.channels * 4, self.channels * 2)
+        self.dec5 = HDDecoder(self.channels * 2, in_channels)
+
         self.aux_cls_head = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(start_dim=1),
-            nn.Linear(170, 4),
+            nn.Linear(self.channels * 16, 6),
+            nn.Sigmoid()
         )
 
+    def forward(self, tensor):
+        enc_out1 = self.enc1(tensor)
+        enc_out2 = self.enc2(enc_out1)
+        enc_out3 = self.enc3(enc_out2)
+        enc_out4 = self.enc4(enc_out3)
+        # enc_out5 = self.enc5(enc_out4)
+        #
+        # dec_out1 = self.dec1(enc_out5)
+        dec_out2 = self.dec2(enc_out4)
+        dec_out3 = self.dec3(dec_out2 + enc_out3)
+        dec_out4 = self.dec4(dec_out3 + enc_out2)
+        dec_out5 = self.dec5(dec_out4 + enc_out1)
+
+        cls_out = self.aux_cls_head(enc_out4)
+
+        dec_out5 = torch.clamp(dec_out5, 0, 1)
+        cls_out = torch.clamp(cls_out, 0, 1)
+        return dec_out5, cls_out
+
+
+class HDemucs(pl.LightningModule):
+    def __init__(self):
+        super(HDemucs, self).__init__()
+        self.model = HybridDemucs(in_channels=85)
+        self.loss_fn_cls = nn.CrossEntropyLoss()
+        self.loss_fn_recon = nn.L1Loss()
+
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=0.0001)
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
         scheduler = lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def training_step(self, train_batch, batch_idx):
-        tensor_signal, tensor_label_cls = train_batch
-        tensor_latent = self.encoder(tensor_signal)
-        tensor_signal_recon = self.decoder(tensor_latent)
-        tensor_pred_cls = self.aux_cls_head(tensor_latent)
+        # Out[1]: torch.Size([190000, 85, 1128])
+        # Out[2]: torch.Size([190000, 2, 3])
 
-        loss_recon = F.l1_loss(tensor_signal, tensor_signal_recon)
-        loss_cls = F.cross_entropy(tensor_pred_cls, tensor_label_cls)
-        loss = loss_cls + loss_recon
+        tensor_signal, tensor_label = train_batch
+        tensor_signal_recon, tensor_pred_reg = self.model(tensor_signal)
+
+        loss_recon = self.loss_fn_recon(tensor_signal, tensor_signal_recon)
+        loss_cd_conf, loss_cd_distance = self.loss_fn_cd(tensor_pred_reg.view(tensor_pred_reg.size(0), -1, 3),
+                                                         tensor_label)
+
+        loss = loss_recon + loss_cd_conf + loss_cd_distance
 
         self.log('train/recon_loss', loss_recon)
-        self.log('train/cls_loss', loss_cls)
+        self.log('train/cd_conf_loss', loss_cd_conf)
+        self.log('train/cd_distance_loss', loss_cd_distance)
         self.log('train/loss', loss)
         return {"loss": loss}
 
     def validation_step(self, val_batch, batch_idx):
-        tensor_signal, tensor_label_cls = val_batch
-        tensor_latent = self.encoder(tensor_signal)
-        tensor_signal_recon = self.decoder(tensor_latent)
-        tensor_pred_cls = self.aux_cls_head(tensor_latent)
+        tensor_signal, tensor_label = val_batch
+        tensor_signal_recon, tensor_pred_reg = self.model(tensor_signal)
 
-        loss_recon = F.l1_loss(tensor_signal, tensor_signal_recon)
-        loss_cls = F.cross_entropy(tensor_pred_cls, tensor_label_cls)
-        loss = loss_cls + loss_recon
+        loss_recon = self.loss_fn_recon(tensor_signal, tensor_signal_recon)
+        loss_cd_conf, loss_cd_distance = self.loss_fn_cd(tensor_pred_reg.view(tensor_pred_reg.size(0), -1, 3),
+                                                         tensor_label)
+
+        loss = loss_recon + loss_cd_conf + loss_cd_distance
 
         self.log('val/recon_loss', loss_recon)
-        self.log('val/cls_loss', loss_cls)
+        self.log('val/cd_conf_loss', loss_cd_conf)
+        self.log('val/cd_distance_loss', loss_cd_distance)
         self.log('val/loss', loss)
+
+        if batch_idx == 0:
+            tensor_signal_sample = tensor_signal[:8].unsqueeze(1)
+            tensor_signal_recon_sample = tensor_signal_recon[:8].unsqueeze(1)
+            tensor_image_result_compare = torchvision.utils.make_grid(
+                torch.cat([tensor_signal_sample, tensor_signal_recon_sample], dim=-1),
+                padding=20,
+                pad_value=1.0,
+                nrow=1,
+            )
+            self.logger.log_image(key="sample", images=[tensor_image_result_compare])
 
     def get_latent(self, tensor):
         return self.encoder(tensor)
 
+    def loss_fn_cd(self, pred, target):
+        # chamfer distance loss
+        conf_loss = 0
+        cd_loss = 0
+        data_count = 0
+
+        for batch_index in range(target.size(0)):
+            for label_index in range(target.size(1)):
+                if target[batch_index, label_index, 0] > 0:
+                    min_distance = torch.tensor(float('inf'))
+                    min_index = 0
+
+                    # confidnece가 1.0 일 때만 distance 계산
+                    for data_index in range(pred.size(1)):
+                        if target[batch_index, data_index, 0] == 1.0:
+                            temp_distance = torch.mean(
+                                (pred[batch_index, data_index, 1:3] - target[batch_index, data_index, 1:3]) ** 2)
+
+                            if temp_distance < min_distance:
+                                min_distance = temp_distance
+                                min_index = data_index
+                        else:
+                            continue
+
+                    # for data_index in range(pred.size(1)):
+                    #     if data_index == min_index:
+                    #         conf_loss += F.binary_cross_entropy(pred[batch_index, data_index, 0].unsqueeze(0), torch.tensor(1.0, device="cuda").unsqueeze(0))
+                    #     else:
+                    #         conf_loss += F.binary_cross_entropy(pred[batch_index, data_index, 0].unsqueeze(0), torch.tensor(0.0, device="cuda").unsqueeze(0))
+
+                    conf_loss += F.binary_cross_entropy(pred[batch_index, min_index, 0].unsqueeze(0),
+                                                        target[batch_index, label_index, 0].unsqueeze(0))
+                    cd_loss += F.mse_loss(pred[batch_index, min_index, 1:3], target[batch_index, label_index, 1:3])
+
+                    # if self.global_step == 2349:
+                    #     print(pred[batch_index])
+                    #     print(target[batch_index])
+
+                    data_count += 1
+                else:
+                    pass
+
+        return conf_loss / data_count, cd_loss / data_count
+
 
 if __name__ == '__main__':
-    model = HDDecoder(80, 160, attension=True)
-    inputs = torch.randn(1, 80, 32)
-    outputs = model(inputs)
-    print(outputs.shape)
+    model = HybridDemucs(in_channels=85)
+    inputs = torch.randn(1, 85, 1280)
+    print(inputs.shape)
+    dec_out, cls_out = model(inputs)
+    print(dec_out.shape)
+    print(cls_out.shape)
