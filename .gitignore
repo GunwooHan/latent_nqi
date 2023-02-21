@@ -1,3 +1,7 @@
+resave.py
+work_batch.sh
+checkpoints
+wandb
 lightning_logs
 dataset
 .idea
