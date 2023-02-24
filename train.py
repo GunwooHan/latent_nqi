@@ -23,17 +23,20 @@ parser.add_argument('--seed', type=int, default=42)
 # 모델 관련 설정
 parser.add_argument('--gpus', type=int, default=1)
 parser.add_argument('--precision', type=int, default=32)
-parser.add_argument('--num_workers', type=int, default=4)
+parser.add_argument('--num_workers', type=int, default=8)
 parser.add_argument('--project', type=str, default='nqi')
 parser.add_argument('--name', type=str, default='nqi_demucs')
 
 # 학습 관련 설정
 parser.add_argument('--epochs', type=int, default=200)
-parser.add_argument('--batch_size', type=int, default=4)
+parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--learning_rate', type=float, default=0.0001)
+parser.add_argument('--num_regression_head', type=int, default=100)
+parser.add_argument('--weight_ce', type=int, default=1)
 # parser.add_argument('--optimizer', type=str, default='adamp')
 # parser.add_argument('--scheduler', type=str, default='reducelr')
 # parser.add_argument('--loss', type=str, default='ce')
+
 
 args = parser.parse_args()
 
@@ -44,7 +47,7 @@ if __name__ == '__main__':
     checkpoint_callback = ModelCheckpoint(
         monitor="val/loss",
         dirpath="checkpoints",
-        filename=f"{args.name}" + "{val/cls_loss:.4f}",
+        filename=f"{args.name}_" + "{val/loss:.4f}",
         save_top_k=3,
         mode="min",
     )
@@ -66,7 +69,7 @@ if __name__ == '__main__':
     # valid_seq = np.load("dataset/test_valid_seq.npy")
     # valid_label = np.load("dataset/test_valid_label.npy")
 
-    model = HDemucs()
+    model = HDemucs(args)
 
     train_ds = NQIDataset(train_seq, train_label)
     train_dataloader = torch.utils.data.DataLoader(train_ds,

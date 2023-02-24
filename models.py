@@ -215,7 +215,7 @@ class HDDecoder(nn.Module):
 
 
 class HybridDemucs(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, num_regression_head=2):
         super().__init__()
         self.channels = 48
         self.enc1 = HDEncoder(in_channels, self.channels * 2)
@@ -233,7 +233,7 @@ class HybridDemucs(nn.Module):
         self.aux_cls_head = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(start_dim=1),
-            nn.Linear(self.channels * 16, 6),
+            nn.Linear(self.channels * 16, num_regression_head * 3),
             nn.Sigmoid()
         )
 
@@ -258,9 +258,10 @@ class HybridDemucs(nn.Module):
 
 
 class HDemucs(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, args):
         super(HDemucs, self).__init__()
-        self.model = HybridDemucs(in_channels=85)
+        self.args = args
+        self.model = HybridDemucs(in_channels=85, num_regression_head=self.args.num_regression_head)
         self.loss_fn_cls = nn.CrossEntropyLoss()
         self.loss_fn_recon = nn.L1Loss()
 
@@ -277,8 +278,9 @@ class HDemucs(pl.LightningModule):
         tensor_signal_recon, tensor_pred_reg = self.model(tensor_signal)
 
         loss_recon = self.loss_fn_recon(tensor_signal, tensor_signal_recon)
-        loss_cd_conf, loss_cd_distance = self.loss_fn_cd(tensor_pred_reg.view(tensor_pred_reg.size(0), -1, 3),
-                                                         tensor_label)
+        loss_cd_conf, loss_cd_distance = self.loss_fn_cd(
+            tensor_pred_reg.view(tensor_pred_reg.size(0), self.args.num_regression_head, 3), tensor_label
+        )
 
         loss = loss_recon + loss_cd_conf + loss_cd_distance
 
@@ -312,7 +314,14 @@ class HDemucs(pl.LightningModule):
                 pad_value=1.0,
                 nrow=1,
             )
-            self.logger.log_image(key="sample", images=[tensor_image_result_compare])
+            self.logger.log_image(key="reconstruction", images=[tensor_image_result_compare])
+
+            sample_pred_reg = tensor_pred_reg[0].reshape(1, self.args.num_regression_head, 3)
+
+            self.logger.log_table(key="sample_label", columns=["label_confidence", "label_a", "label_b"],
+                                  data=tensor_label[0].tolist())
+            self.logger.log_table(key="sample_pred", columns=["pred_confidence", "pred_a", "pred_b"],
+                                  data=sample_pred_reg[0, sample_pred_reg[0, :, 0].argsort(descending=True)].tolist())
 
     def get_latent(self, tensor):
         return self.encoder(tensor)
@@ -321,51 +330,40 @@ class HDemucs(pl.LightningModule):
         # chamfer distance loss
         conf_loss = 0
         cd_loss = 0
-        data_count = 0
+        cd_data_count = 0
+        conf_data_count = 0
 
         for batch_index in range(target.size(0)):
             for label_index in range(target.size(1)):
                 if target[batch_index, label_index, 0] > 0:
-                    min_distance = torch.tensor(float('inf'))
-                    min_index = 0
-
                     # confidnece가 1.0 일 때만 distance 계산
-                    for data_index in range(pred.size(1)):
-                        if target[batch_index, data_index, 0] == 1.0:
-                            temp_distance = torch.mean(
-                                (pred[batch_index, data_index, 1:3] - target[batch_index, data_index, 1:3]) ** 2)
+                    temp_distance = torch.mean(
+                        (target[batch_index, label_index, 1:3].unsqueeze(0) - pred[batch_index, :, 1:3]) ** 2,
+                        dim=1)
 
-                            if temp_distance < min_distance:
-                                min_distance = temp_distance
-                                min_index = data_index
-                        else:
-                            continue
+                    min_index = torch.argmin(temp_distance)
 
-                    # for data_index in range(pred.size(1)):
-                    #     if data_index == min_index:
-                    #         conf_loss += F.binary_cross_entropy(pred[batch_index, data_index, 0].unsqueeze(0), torch.tensor(1.0, device="cuda").unsqueeze(0))
-                    #     else:
-                    #         conf_loss += F.binary_cross_entropy(pred[batch_index, data_index, 0].unsqueeze(0), torch.tensor(0.0, device="cuda").unsqueeze(0))
+                    conf_label = torch.zeros(pred.size(1), device="cuda")
+                    conf_label[min_index] = 1.0
 
-                    conf_loss += F.binary_cross_entropy(pred[batch_index, min_index, 0].unsqueeze(0),
-                                                        target[batch_index, label_index, 0].unsqueeze(0))
-                    cd_loss += F.mse_loss(pred[batch_index, min_index, 1:3], target[batch_index, label_index, 1:3])
+                    # conf_loss += F.binary_cross_entropy(pred[batch_index, min_index, 0].unsqueeze(0),
+                    #                                     torch.ones(1, device="cuda"))
+                    conf_loss_array = F.binary_cross_entropy(pred[batch_index, :, 0], conf_label, reduction='none')
+                    conf_loss_array[min_index] *= self.args.weight_ce #pred.size(1)
+                    conf_loss += torch.mean(conf_loss_array)
+                    cd_loss += F.l1_loss(pred[batch_index, min_index, 1:3], target[batch_index, label_index, 1:3])
 
-                    # if self.global_step == 2349:
-                    #     print(pred[batch_index])
-                    #     print(target[batch_index])
-
-                    data_count += 1
+                    conf_data_count += 1
+                    cd_data_count += 1
                 else:
                     pass
 
-        return conf_loss / data_count, cd_loss / data_count
+        return conf_loss / conf_data_count, cd_loss / cd_data_count
 
-
-if __name__ == '__main__':
-    model = HybridDemucs(in_channels=85)
-    inputs = torch.randn(1, 85, 1280)
-    print(inputs.shape)
-    dec_out, cls_out = model(inputs)
-    print(dec_out.shape)
-    print(cls_out.shape)
+    if __name__ == '__main__':
+        model = HybridDemucs(in_channels=85)
+        inputs = torch.randn(1, 85, 1280)
+        print(inputs.shape)
+        dec_out, cls_out = model(inputs)
+        print(dec_out.shape)
+        print(cls_out.shape)
